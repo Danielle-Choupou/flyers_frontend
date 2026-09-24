@@ -1,0 +1,7 @@
+streamlit
+python-dotenv
+requests
+Pillow
+streamlit-drawable-canvas
+streamlit-image-select
+streamlit-cropper
