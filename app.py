@@ -21,6 +21,18 @@ def api_get(path,**kwargs):
         r=requests.get(f'{API_URL}{path}',timeout=20,**kwargs); r.raise_for_status(); return r.json()
     except Exception as e: st.error(f'Backend indisponible : {e}'); return None
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_history_images():
+    response = requests.get(f'{API_URL}/historique', timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_history_image(url):
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.content
+
 def detail(r):
     try:return r.json().get('detail',r.text)
     except:return r.text
@@ -38,6 +50,8 @@ def enregistrer_image_historique(image_bytes):
 
         if not r.ok:
             st.error(f'Erreur historique : {r.text}')
+        else:
+            fetch_history_images.clear()
 
     except Exception as e:
         st.error(f'Erreur historique : {e}')
@@ -53,6 +67,8 @@ def caption(data,instruction=''):
         r=requests.post(f'{API_URL}/generate-caption',json=payload,timeout=30)
         return r.json().get('caption') if r.ok else None
     except:return None
+
+@st.cache_data(ttl=60, show_spinner=False)
 def preview_flyer(entreprise, modele, langue, valeurs, image_bytes, fontes=None):
     data = {
         'entreprise': entreprise,
@@ -132,7 +148,7 @@ with gestion_modeles:
 
     action_modele=st.radio(
         'Action',
-        ['Créer un modèle','Modifier un modèle'],
+        ['Créer un modèle','Modifier un modèle','Supprimer un modèle'],
         horizontal=True,
         label_visibility='collapsed'
     )
@@ -207,36 +223,81 @@ with gestion_modeles:
                 else:
                     st.error(detail(r))
 
-    else:
-
-        modele_edit=st.selectbox(
-        'Modèle à modifier',
-        modeles_existants,
-        key='edit_modele'
-    )
-
-    if st.button('✏️ Modifier',use_container_width=True):
-        r=requests.get(
-            f'{API_URL}/modeles/{e}/{modele_edit}',
-            timeout=10
-        )
-
-        if r.ok:
+    elif action_modele=='Modifier un modèle':
+        modele_edit=st.selectbox('Modèle à modifier', modeles_existants, key='edit_modele')
+        if st.session_state.get('modele_a_modifier') != modele_edit or st.session_state.get('entreprise_a_modifier') != e:
+            r=requests.get(f'{API_URL}/modeles/{e}/{modele_edit}', timeout=10)
+            if not r.ok:
+                st.error(detail(r))
+                st.stop()
             st.session_state['modele_a_modifier']=modele_edit
+            st.session_state['entreprise_a_modifier']=e
             st.session_state['modele_config']=r.json()
-            st.rerun()
-        else:
-            st.error(detail(r))
 
-    if st.session_state.get('modele_a_modifier'):
-        modele_edit=st.session_state['modele_a_modifier']
-
-        result=afficher_editeur (
-            e,
-            modele_edit,
-            mode='modifier',
-            config=st.session_state.get('modele_config')
+        objectif_edit=st.text_input(
+            'Objectif de publication',
+            value=st.session_state['modele_config'].get('objectif_publication', ''),
+            key=f'objectif_edit_{e}_{modele_edit}'
         )
+        result=afficher_editeur(e, modele_edit, mode='modifier', config=st.session_state.get('modele_config'))
+        if result and st.button('💾 Enregistrer les modifications', type='primary', use_container_width=True):
+            data={'zones_modifiables': json.dumps(result['config']['zones_modifiables']), 'objectif_publication': objectif_edit}
+            try:
+                with st.spinner('Enregistrement du modèle dans Supabase...'):
+                    r=requests.put(
+                        f'{API_URL}/modeles/{e}/{modele_edit}/fichiers',
+                        data=data,
+                        files=result['_changed_files'],
+                        timeout=(10, 180)
+                    )
+                if r.ok:
+                    st.session_state['modele_config']=r.json()['config']
+                    st.cache_data.clear()
+                    st.success('✅ Modèle modifié avec succès.')
+                    st.rerun()
+                else:
+                    st.error(detail(r))
+            except requests.RequestException as exc:
+                st.error(f"La requête a expiré ou la connexion au backend a échoué : {exc}")
+                st.warning("Vérifie ensuite le modèle dans l'application avant de relancer l'enregistrement : le serveur peut avoir terminé après l'expiration côté interface.")
+
+    elif modeles_existants:
+        modele_a_supprimer=st.selectbox(
+            'Modèle à supprimer',
+            modeles_existants,
+            key='delete_model_selection'
+        )
+        st.warning(
+            f"Cette action supprimera « {modele_a_supprimer} » de l’entreprise « {e} » "
+            "ainsi que ses fichiers associés. Elle est définitive."
+        )
+        confirmer_suppression=st.checkbox(
+            f"Je confirme la suppression de {modele_a_supprimer}",
+            key=f'confirm_delete_model_{e}_{modele_a_supprimer}'
+        )
+        if st.button(
+            '🗑️ Supprimer définitivement le modèle',
+            type='primary',
+            disabled=not confirmer_suppression,
+            use_container_width=True
+        ):
+            try:
+                r=requests.delete(
+                    f'{API_URL}/modeles/{e}/{modele_a_supprimer}',
+                    timeout=60
+                )
+                if r.ok:
+                    if st.session_state.get('modele_a_modifier') == modele_a_supprimer and st.session_state.get('entreprise_a_modifier') == e:
+                        for cle in ('modele_a_modifier','entreprise_a_modifier','modele_config'):
+                            st.session_state.pop(cle, None)
+                    st.success(f"Le modèle « {modele_a_supprimer} » a été supprimé de « {e} ».")
+                    st.rerun()
+                else:
+                    st.error(detail(r))
+            except requests.RequestException as exc:
+                st.error(f"La suppression a échoué ou le backend ne répond pas : {exc}")
+    else:
+        st.info("Cette entreprise ne contient aucun modèle à supprimer.")
 
 with onglet_creation:
     col1,col2=st.columns([1.2,1])
@@ -368,28 +429,35 @@ with onglet_creation:
                             st.error(detail(r))
 
                 elif mode=='Historique':
-                    images_historique=api_get('/historique') or []
+                    try:
+                        images_historique=fetch_history_images()
+                    except requests.RequestException as e:
+                        images_historique=[]
+                        st.error(f"Impossible de charger l'historique : {e}")
 
                     if images_historique:
                         urls=[image['url'] for image in images_historique]
 
-                        choix=image_select(
+                        index_choisi=image_select(
                             'Cliquez sur l’image :',
                             urls,
-                            use_container_width=True
+                            index=min(st.session_state.get('history_index', 0), len(urls)-1),
+                            use_container_width=True,
+                            return_value='index',
+                            key=f'history_picker_{entreprise}_{modele}'
                         )
 
-                        if choix:
+                        if index_choisi is not None:
+                            url_choisie=urls[index_choisi]
+                            nouvelle_selection=f"{entreprise}/{modele}/{url_choisie}"
                             try:
-                                r=requests.get(choix,timeout=20)
-
-                                if r.ok:
-                                    st.session_state.image_valide_bytes=r.content
-                                else:
-                                    st.error('Impossible de charger cette image.')
-
-                            except Exception as e:
-                                st.error(f'Erreur lors du chargement : {e}')
+                                if st.session_state.get('history_selection') != nouvelle_selection:
+                                    st.session_state.image_valide_bytes=fetch_history_image(url_choisie)
+                                    st.session_state.image_croppee_bytes=None
+                                    st.session_state.history_selection=nouvelle_selection
+                                st.session_state.history_index=index_choisi
+                            except requests.RequestException as e:
+                                st.error(f'Erreur lors du chargement de cette image : {e}')
                     else:
                         st.info("Aucune image dans l'historique. Veuillez générer ou télécharger une image d'abord.")
 
