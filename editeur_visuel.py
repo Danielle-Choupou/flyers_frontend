@@ -1,14 +1,48 @@
-import os
 import io
+import re
+
 import requests
-from pathlib import Path
-from dotenv import load_dotenv
 import streamlit as st
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
 
-load_dotenv()
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+try:
+    from streamlit_drawable_canvas import st_canvas
+except Exception:  # pragma: no cover - only for tests and non-Streamlit usage.
+    st_canvas = None
+
+
+def _extract_zone_number(label):
+    if label is None:
+        return None
+    match = re.search(r"(?i)\bzone\s*(\d+)\b", str(label).strip())
+    if not match:
+        return None
+
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _normalize_zone_labels(objects):
+    normalized = []
+    for index, obj in enumerate(objects or [], start=1):
+        if not isinstance(obj, dict):
+            continue
+        cloned = dict(obj)
+        cloned["label"] = f"Zone {index}"
+        normalized.append(cloned)
+    return normalized
+
+
+def _next_zone_number(objects):
+    return 1 if not objects else len(objects) + 1
+
+def backend_url():
+    try:
+        return st.secrets.get("API_URL", "http://127.0.0.1:8000").rstrip("/")
+    except (FileNotFoundError, AttributeError):
+        return "http://127.0.0.1:8000"
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -21,7 +55,7 @@ def _telecharger_fichier_modele(url):
 
 
 def charger_fichier(entreprise, modele, fichier):
-    url = f"{API_URL}/modeles/{entreprise}/{modele}/fichier/{fichier}"
+    url = f"{backend_url()}/modeles/{entreprise}/{modele}/fichier/{fichier}"
     try:
         return _telecharger_fichier_modele(url)
     except requests.HTTPError as exc:
@@ -181,12 +215,28 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
                 "strokeUniform": True
             })
 
-    outil = st.radio(
-        "Outil",
-        ["✋ Déplacer/redimensionner", "➕ Ajouter une zone"],
-        horizontal=True,
-        key=f"outil_{entreprise}_{modele}"
-    )
+    canvas_key = f"canvas_{entreprise}_{modele}_{modification}"
+    canvas_objects_key = f"{canvas_key}_objects"
+    prochain_numero_key = f"{canvas_key}_prochain_numero"
+
+    if canvas_objects_key not in st.session_state:
+        st.session_state[canvas_objects_key] = _normalize_zone_labels(initial_objects)
+
+    current_objects = _normalize_zone_labels(st.session_state.get(canvas_objects_key, []))
+    st.session_state[canvas_objects_key] = current_objects
+    st.session_state[prochain_numero_key] = 1 if not current_objects else len(current_objects) + 1
+
+    if st_canvas is None:
+        st.error("Le composant de dessin n'est pas disponible dans cet environnement.")
+        return None
+
+    initial_drawing = None
+    if not current_objects and initial_objects:
+        initial_drawing = {
+            "version": "5.2.4",
+            "objects": _normalize_zone_labels(initial_objects)
+        }
+
     canvas = st_canvas(
         fill_color="rgba(255, 0, 0, 0.15)",
         stroke_width=2,
@@ -195,22 +245,31 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
         update_streamlit=True,
         height=height,
         width=width,
-        drawing_mode="rect",
-        initial_drawing={"version": "5.2.4", "objects": initial_objects} if initial_objects else None,
-        key=f"canvas_{entreprise}_{modele}_{modification}"
+        drawing_mode="labeled_rect",
+        initial_drawing=initial_drawing,
+        key=canvas_key,
+        label=f"Zone {st.session_state[prochain_numero_key]}",
+        font_size=16
     )
 
     objects = (canvas.json_data or {}).get("objects", [])
+    normalized_objects = _normalize_zone_labels(objects)
+    st.session_state[canvas_objects_key] = normalized_objects
+    st.session_state[prochain_numero_key] = 1 if not normalized_objects else len(normalized_objects) + 1
+    if canvas.json_data is None:
+        canvas.json_data = {}
+    canvas.json_data["objects"] = normalized_objects
 
     if not objects and not modification:
         st.info("Dessine au moins une zone sur le modèle.")
         return None
 
     zones = {}
+    resume_zones = []
     factor = image.width / width
 
     for i, obj in enumerate(objects):
-        label = obj.get("label", "")
+        label = (obj.get("label") or "").strip() or f"Zone {i + 1}"
         left = float(obj.get("left", 0))
         top = float(obj.get("top", 0))
         w = float(obj.get("width", 0)) * float(obj.get("scaleX", 1))
@@ -222,13 +281,14 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
         ww = min(round(w * factor), image.width - x)
         hh = min(round(h * factor), image.height - y)
 
-        zone_key = label.strip() or f"nouvelle_{i}"
+        zone_index_key = f"zone_{i}_{entreprise}_{modele}"
+        st.markdown(f"#### Zone {i + 1}")
         c1, c2 = st.columns([2, 1])
 
         with c1:
             name = st.text_input(
-                f"Nom de la zone {i + 1}",
-                key=f"name_{entreprise}_{modele}_{zone_key}",
+                "Nom de la zone",
+                key=f"name_{zone_index_key}",
                 value=label,
                 placeholder="Ex: titre, prix, image, description..."
             )
@@ -241,7 +301,7 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
                 type_options,
                 index=type_options.index(zone_existante.get("type", "texte"))
                 if zone_existante.get("type", "texte") in type_options else 0,
-                key=f"type_{entreprise}_{modele}_{zone_key}_v2"
+                key=f"type_{zone_index_key}_v2"
             )
 
         if not name.strip():
@@ -311,6 +371,14 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
                 "size": int(size),
                 "alignement": alignement
             }
+            resume_zones.append({
+                "Nom de la zone": name.strip(),
+                "Contenu attendu": "Texte",
+                "Présentation": f"{font}, taille {int(size)}, "
+                f"{'gras' if weight >= 700 else 'normal'}"
+                f"{' italique' if style == 'italic' else ''}",
+                "Dimensions de la zone": f"{ww} × {hh} px",
+            })
 
         else:
             zones[name.strip()] = {
@@ -320,12 +388,22 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
                 "largeur": ww,
                 "hauteur": hh
             }
+            resume_zones.append({
+                "Nom de la zone": name.strip(),
+                "Contenu attendu": "Image",
+                "Présentation": "Zone réservée à une image",
+                "Dimensions de la zone": f"{ww} × {hh} px",
+            })
 
     if not zones:
         return None
 
-    st.write("### Aperçu des zones")
-    st.json(zones)
+    st.write("### Vérification du modèle")
+    st.caption(
+        f"Le modèle contient {len(resume_zones)} zone(s). Vérifiez leur nom, "
+        "leur usage et leur présentation sur l’aperçu ci-dessus."
+    )
+    st.table(resume_zones)
 
     return {
         "entreprise": entreprise,

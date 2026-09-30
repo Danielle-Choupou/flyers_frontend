@@ -2,26 +2,34 @@ import io,json,os,requests,hashlib
 from dotenv import load_dotenv
 import streamlit as st
 from PIL import Image, ImageOps, ImageFilter
-from streamlit_image_select import image_select
 from streamlit_cropper import st_cropper
 from editeur_visuel import afficher_editeur
 
 load_dotenv()
-API_URL=os.getenv('API_URL','http://127.0.0.1:8000')
+try:
+    API_URL=st.secrets.get('API_URL',os.getenv('API_URL','http://127.0.0.1:8000')).rstrip('/')
+except (FileNotFoundError, AttributeError):
+    API_URL=os.getenv('API_URL','http://127.0.0.1:8000').rstrip('/')
 st.set_page_config(page_title='Générateur Flyers Pro',layout='wide',page_icon='✨')
 st.title('✨ Visual Copilot AI')
 st.caption('Générateur de flyers automatisé')
 
 
-for key,default in {'image_valide_bytes':None,'img_page':1,'flyer_genere':None,'chat_caption':[],'caption_valide':False,'attente_consigne':False,'derniere_data_flyer':None,'image_croppee_bytes':None,'modeles_details': {}}.items():
+for key,default in {'image_valide_bytes':None,'img_page':1,'flyer_genere':None,'caption_adaptations':{},'texte_accompagnement_source':'','derniere_data_flyer':None,'image_croppee_bytes':None,'modeles_details': {}}.items():
     if key not in st.session_state: st.session_state[key]=default
 
-def api_get(path,**kwargs):
+@st.cache_data(ttl=60, show_spinner=False)
+def _api_get_json(path):
+    response=requests.get(f'{API_URL}{path}',timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+def api_get(path):
     try:
-        r=requests.get(f'{API_URL}{path}',timeout=20,**kwargs); r.raise_for_status(); return r.json()
+        return _api_get_json(path)
     except Exception as e: st.error(f'Backend indisponible : {e}'); return None
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=2700, show_spinner=False)
 def fetch_history_images():
     response = requests.get(f'{API_URL}/historique', timeout=20)
     response.raise_for_status()
@@ -32,6 +40,16 @@ def fetch_history_image(url):
     response = requests.get(url, timeout=30)
     response.raise_for_status()
     return response.content
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_history_thumbnail(url):
+    response=requests.get(url,timeout=30)
+    response.raise_for_status()
+    image=Image.open(io.BytesIO(response.content)).convert('RGB')
+    thumbnail=ImageOps.fit(image,(160,120),method=Image.Resampling.LANCZOS)
+    output=io.BytesIO()
+    thumbnail.save(output,format='JPEG',quality=78,optimize=True)
+    return output.getvalue()
 
 def detail(r):
     try:return r.json().get('detail',r.text)
@@ -66,6 +84,12 @@ def caption(data,instruction=''):
     try:
         r=requests.post(f'{API_URL}/generate-caption',json=payload,timeout=30)
         return r.json().get('caption') if r.ok else None
+    except:return None
+
+def adapter_caption(data):
+    try:
+        r=requests.post(f'{API_URL}/adapt-caption',json=data,timeout=120)
+        return r.json().get('adaptations') if r.ok else None
     except:return None
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -123,22 +147,22 @@ with gestion_entreprises:
 
     if action=='Ajouter':
         nom=st.text_input('Nom de l’entreprise'); officiel=st.text_input('Nom officiel'); secteur=st.text_input('Secteur d’activité'); mission=st.text_area('Mission')
-        if st.button('➕ Ajouter l’entreprise',use_container_width=True):
+        if st.button('➕ Ajouter l’entreprise', width='stretch'):
             r=requests.post(f'{API_URL}/entreprises',json={'nom':nom,'nom_officiel':officiel,'secteur_activite':secteur,'mission':mission})
-            if r.ok: st.success('Entreprise ajoutée.'); st.rerun()
+            if r.ok: _api_get_json.clear(); st.success('Entreprise ajoutée.'); st.rerun()
             else: st.error(detail(r))
     elif action=='Modifier':
         e=st.selectbox('Entreprise',entreprises,key='edit_ent'); p=api_get(f'/entreprises/{e}') or {}
         officiel=st.text_input('Nom officiel',p.get('nom_officiel','')); secteur=st.text_input('Secteur',p.get('secteur_activite','')); mission=st.text_area('Mission',p.get('mission',''))
-        if st.button('💾 Enregistrer',use_container_width=True):
+        if st.button('💾 Enregistrer', width='stretch'):
             r=requests.put(f'{API_URL}/entreprises/{e}',json={'nom_officiel':officiel,'secteur_activite':secteur,'mission':mission})
-            if r.ok: st.success('Modification enregistrée.'); st.rerun()
+            if r.ok: _api_get_json.clear(); st.success('Modification enregistrée.'); st.rerun()
             else: st.error(detail(r))
     elif action=='Supprimer':
         e=st.selectbox('Entreprise',entreprises,key='del_ent')
-        if st.button('🗑️ Supprimer',use_container_width=True):
+        if st.button('🗑️ Supprimer', width='stretch'):
             r=requests.delete(f'{API_URL}/entreprises/{e}')
-            if r.ok: st.success('Entreprise supprimée.'); st.rerun()
+            if r.ok: _api_get_json.clear(); st.success('Entreprise supprimée.'); st.rerun()
             else: st.error(detail(r))
 with gestion_modeles:
     st.subheader("Modèles")
@@ -180,10 +204,16 @@ with gestion_modeles:
         if nom.strip():
             result=afficher_editeur(e,nom.strip(),mode='nouveau')
 
+            confirmation_modele=st.checkbox(
+                'J’ai vérifié l’aperçu et les zones du modèle.',
+                key=f'confirm_new_model_{e}_{nom.strip()}'
+            ) if result else False
+
             if result and st.button(
                 '💾 Enregistrer le modèle',
                 type='primary',
-                use_container_width=True
+                width='stretch',
+                disabled=not confirmation_modele
             ):
                 f=result.pop('_files')
                 cfg=result['config']
@@ -202,7 +232,7 @@ with gestion_modeles:
                         'objectif_publication':obj
                     },
                     files=multipart,
-                    timeout=30
+                    timeout=(10, 180)
                 )
 
                 if r.ok:
@@ -216,6 +246,8 @@ with gestion_modeles:
                     )
 
                     if save.ok:
+                        _api_get_json.clear()
+                        st.session_state['modeles_details']={}
                         st.success('✅ Modèle enregistré avec succès.')
                         st.rerun()
                     else:
@@ -240,7 +272,7 @@ with gestion_modeles:
             key=f'objectif_edit_{e}_{modele_edit}'
         )
         result=afficher_editeur(e, modele_edit, mode='modifier', config=st.session_state.get('modele_config'))
-        if result and st.button('💾 Enregistrer les modifications', type='primary', use_container_width=True):
+        if result and st.button('💾 Enregistrer les modifications', type='primary', width='stretch'):
             data={'zones_modifiables': json.dumps(result['config']['zones_modifiables']), 'objectif_publication': objectif_edit}
             try:
                 with st.spinner('Enregistrement du modèle dans Supabase...'):
@@ -252,7 +284,9 @@ with gestion_modeles:
                     )
                 if r.ok:
                     st.session_state['modele_config']=r.json()['config']
-                    st.cache_data.clear()
+                    _api_get_json.clear()
+                    preview_flyer.clear()
+                    st.session_state['modeles_details']={}
                     st.success('✅ Modèle modifié avec succès.')
                     st.rerun()
                 else:
@@ -279,7 +313,7 @@ with gestion_modeles:
             '🗑️ Supprimer définitivement le modèle',
             type='primary',
             disabled=not confirmer_suppression,
-            use_container_width=True
+            width='stretch'
         ):
             try:
                 r=requests.delete(
@@ -291,6 +325,8 @@ with gestion_modeles:
                         for cle in ('modele_a_modifier','entreprise_a_modifier','modele_config'):
                             st.session_state.pop(cle, None)
                     st.success(f"Le modèle « {modele_a_supprimer} » a été supprimé de « {e} ».")
+                    _api_get_json.clear()
+                    st.session_state['modeles_details']={}
                     st.rerun()
                 else:
                     st.error(detail(r))
@@ -408,6 +444,38 @@ with onglet_creation:
                 st.session_state['generation_values']=valeurs
                 st.session_state['generation_fonts']=fontes
 
+                st.session_state['texte_accompagnement_source']=st.text_area(
+                    'Texte d’accompagnement à adapter',
+                    value=st.session_state.get('texte_accompagnement_source',''),
+                    height=160,
+                    placeholder='Collez ici le texte que vous souhaitez adapter pour chaque réseau social.',
+                    help='L’IA reformulera uniquement ce texte selon les règles de chaque plateforme.'
+                )
+                st.session_state['reseaux_accompagnement']=st.multiselect(
+                    'Réseaux sociaux à préparer',
+                    ['Facebook','TikTok','LinkedIn','Instagram','YouTube','Google Business Profile'],
+                    default=['Facebook','Instagram','LinkedIn'],
+                    key='caption_networks'
+                )
+                if st.button('✨ Adapter le texte pour les réseaux', width='stretch'):
+                    texte_source=st.session_state.get('texte_accompagnement_source','').strip()
+                    reseaux=st.session_state.get('reseaux_accompagnement',[])
+                    if not texte_source:
+                        st.warning('Collez d’abord un texte d’accompagnement à adapter.')
+                    elif not reseaux:
+                        st.warning('Sélectionnez au moins un réseau social.')
+                    else:
+                        with st.spinner('Adaptation du texte en cours...'):
+                            adaptations=adapter_caption({
+                                'entreprise':entreprise,
+                                'template_type':modele,
+                                'langue':langue,
+                                'texte_source':texte_source,
+                                'reseaux':reseaux,
+                            })
+                        if adaptations:
+                            st.session_state.caption_adaptations=adaptations
+
                                 
 
             with image_tab:
@@ -420,7 +488,7 @@ with onglet_creation:
 
                 elif mode=='Générer avec IA':
                     prompt=st.text_area('🎨 Décrivez l’image à générer',height=80)
-                    if st.button('✨ Générer l’image',use_container_width=True):
+                    if st.button('✨ Générer l’image', width='stretch'):
                         r=requests.post(f'{API_URL}/generate-image-ia',json={'prompt':prompt},timeout=120)
                         if r.ok:
                             st.session_state.image_valide_bytes=r.content
@@ -436,28 +504,28 @@ with onglet_creation:
                         st.error(f"Impossible de charger l'historique : {e}")
 
                     if images_historique:
-                        urls=[image['url'] for image in images_historique]
-
-                        index_choisi=image_select(
-                            'Cliquez sur l’image :',
-                            urls,
-                            index=min(st.session_state.get('history_index', 0), len(urls)-1),
-                            use_container_width=True,
-                            return_value='index',
-                            key=f'history_picker_{entreprise}_{modele}'
-                        )
-
-                        if index_choisi is not None:
-                            url_choisie=urls[index_choisi]
-                            nouvelle_selection=f"{entreprise}/{modele}/{url_choisie}"
-                            try:
-                                if st.session_state.get('history_selection') != nouvelle_selection:
-                                    st.session_state.image_valide_bytes=fetch_history_image(url_choisie)
-                                    st.session_state.image_croppee_bytes=None
-                                    st.session_state.history_selection=nouvelle_selection
-                                st.session_state.history_index=index_choisi
-                            except requests.RequestException as e:
-                                st.error(f'Erreur lors du chargement de cette image : {e}')
+                        st.caption('Choisis une image de l’historique')
+                        colonnes=st.columns(4)
+                        for index, image_historique in enumerate(images_historique):
+                            nom_image=image_historique.get('nom',f'image_{index}')
+                            url_image=image_historique['url']
+                            with colonnes[index % len(colonnes)]:
+                                try:
+                                    miniature=fetch_history_thumbnail(url_image)
+                                    st.image(miniature,width=160)
+                                    selectionnee=st.session_state.get('history_selection')==nom_image
+                                    if st.button(
+                                        '✓ Sélectionnée' if selectionnee else 'Choisir',
+                                        key=f'history_select_{nom_image}',
+                                        disabled=selectionnee,
+                                        width='stretch'
+                                    ):
+                                        st.session_state.image_valide_bytes=fetch_history_image(url_image)
+                                        st.session_state.image_croppee_bytes=None
+                                        st.session_state.history_selection=nom_image
+                                        st.rerun()
+                                except requests.RequestException as exc:
+                                    st.error(f"Miniature indisponible ({nom_image}) : {exc}")
                     else:
                         st.info("Aucune image dans l'historique. Veuillez générer ou télécharger une image d'abord.")
 
@@ -522,18 +590,18 @@ with onglet_creation:
                         st.session_state.image_croppee_bytes=st.session_state.image_valide_bytes
                         st.image(img,width=220)
 
-                    if st.button('🗑️ Retirer l’image',use_container_width=True):
+                    if st.button('🗑️ Retirer l’image', width='stretch'):
                         st.session_state.image_valide_bytes=None
                         st.session_state.image_croppee_bytes=None
                         st.rerun()
 
-        generate_btn=st.button('🎨 GÉNÉRER LE FLYER',type='primary',use_container_width=True)
+        generate_btn=st.button('🎨 GÉNÉRER LE FLYER', type='primary', width='stretch')
 
     with col2:
         st.subheader('Aperçu')
         preview_zone=st.empty()
 
-        if not st.session_state.flyer_genere and modele and model_cfg:
+        if modele and model_cfg:
             valeurs_preview=st.session_state.get('generation_values',{})
             fontes_preview=st.session_state.get('generation_fonts',{})
             image_preview=st.session_state.image_croppee_bytes if mode!='Par défaut' else None
@@ -554,7 +622,7 @@ with onglet_creation:
                 preview_zone.image(
                     img_preview,
                     caption='Prévisualisation — génération non terminée',
-                    use_container_width=True
+                    width='stretch'
                 )
 
         flyer_zone=st.empty()
@@ -577,13 +645,7 @@ with onglet_creation:
                     st.session_state.flyer_genere=r.content
                     preview_zone.empty()
 
-                    caption_data={'entreprise':entreprise,'template_type':modele,'langue':langue,**valeurs}
-                    st.session_state.derniere_data_flyer=caption_data
-
-                    txt=caption(caption_data)
-                    st.session_state.chat_caption=[{'role':'assistant','content':txt}] if txt else []
-                    st.session_state.caption_valide=False
-                    st.session_state.attente_consigne=False
+                    st.session_state.derniere_data_flyer={'entreprise':entreprise,'template_type':modele,'langue':langue,**valeurs}
 
                 else:
                     st.error(f'Erreur serveur : {r.text}')
@@ -593,21 +655,11 @@ with onglet_creation:
 
         if st.session_state.flyer_genere:
             with flyer_zone.container():
-                st.image(st.session_state.flyer_genere,caption='Votre flyer est prêt !',use_container_width=True)
-                st.download_button('💾 TÉLÉCHARGER (PNG HD)',st.session_state.flyer_genere,f'Flyer_{entreprise}_{modele}.png'.replace(' ','_'),'image/png',use_container_width=True)
+                st.image(st.session_state.flyer_genere, caption='Votre flyer est prêt !', width='stretch')
+                st.download_button('💾 TÉLÉCHARGER (PNG HD)', st.session_state.flyer_genere, f'Flyer_{entreprise}_{modele}.png'.replace(' ', '_'), 'image/png', width='stretch')
 
-if st.session_state.chat_caption:
-    st.divider(); st.subheader('Texte généré')
-    for msg in st.session_state.chat_caption:
-        with st.chat_message(msg['role']): st.write(msg['content'])
-    if not st.session_state.caption_valide and not st.session_state.attente_consigne:
-        st.write('**Ce texte vous convient-il ?**'); a,b=st.columns(2)
-        if a.button('✅ Oui, je valide',use_container_width=True): st.session_state.caption_valide=True; st.rerun()
-        if b.button('✏️ Non, je veux modifier',use_container_width=True): st.session_state.attente_consigne=True; st.rerun()
-    elif st.session_state.attente_consigne:
-        consigne=st.chat_input('Dites-moi comment vous voulez que je le réécrive...')
-        if consigne:
-            st.session_state.chat_caption.append({'role':'user','content':consigne}); txt=caption(st.session_state.derniere_data_flyer,consigne)
-            if txt: st.session_state.chat_caption.append({'role':'assistant','content':txt})
-            st.session_state.attente_consigne=False; st.rerun()
-    else: st.success('✅ Texte validé — il est prêt à être copié/utilisé.')
+if st.session_state.caption_adaptations:
+    st.divider(); st.subheader('Textes adaptés par réseau social')
+    for reseau, resultat in st.session_state.caption_adaptations.items():
+        st.markdown(f'**{reseau}** — {resultat["caracteres"]}/{resultat["maximum"]} caractères')
+        st.text_area(f'Texte {reseau}', value=resultat['texte'], height=170, key=f'adaptation_{reseau}')
