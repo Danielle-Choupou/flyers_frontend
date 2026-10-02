@@ -1,4 +1,5 @@
-import io,json,os,requests,hashlib
+import io,json,os,requests,hashlib,uuid
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import streamlit as st
 from PIL import Image, ImageOps, ImageFilter
@@ -15,29 +16,49 @@ st.title('✨ Visual Copilot AI')
 st.caption('Générateur de flyers automatisé')
 
 
-for key,default in {'image_valide_bytes':None,'img_page':1,'flyer_genere':None,'caption_adaptations':{},'texte_accompagnement_source':'','derniere_data_flyer':None,'image_croppee_bytes':None,'modeles_details': {}}.items():
+for key,default in {'image_valide_bytes':None,'img_page':1,'flyer_genere':None,'flyer_genere_signature':None,'caption_adaptations':{},'texte_accompagnement_source':'','derniere_data_flyer':None,'image_croppee_bytes':None,'modeles_details': {},'preview_flyer_bytes':None,'preview_flyer_signature':None,'preview_flyer_error_signature':None,'preview_flyer_error':None,'image_model_context':None}.items():
     if key not in st.session_state: st.session_state[key]=default
 
+def _api_error_message(response):
+    try:
+        detail_value=response.json().get('detail')
+        if detail_value:
+            return str(detail_value)
+    except (ValueError, AttributeError):
+        pass
+    return response.text[:500] if response is not None else 'Réponse indisponible'
+
 @st.cache_data(ttl=60, show_spinner=False)
-def _api_get_json(path):
-    response=requests.get(f'{API_URL}{path}',timeout=20)
+def _api_get_json(path,_request_id):
+    response=requests.get(
+        f'{API_URL}{path}',
+        headers={'X-Request-ID':_request_id},
+        timeout=20
+    )
     response.raise_for_status()
     return response.json()
 
 def api_get(path):
+    request_id=uuid.uuid4().hex
     try:
-        return _api_get_json(path)
-    except Exception as e: st.error(f'Backend indisponible : {e}'); return None
+        return _api_get_json(path,request_id)
+    except requests.Timeout:
+        st.error(f"Délai dépassé pendant la lecture de {path}. Référence : {request_id}")
+        return None
+    except requests.RequestException as exc:
+        response=getattr(exc,'response',None)
+        st.error(f"Lecture de {path} échouée : {_api_error_message(response)}. Référence : {request_id}")
+        return None
 
-@st.cache_data(ttl=2700, show_spinner=False)
-def fetch_history_images():
-    response = requests.get(f'{API_URL}/historique', timeout=20)
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_history_images(page):
+    response = requests.get(f'{API_URL}/historique', params={'page': page}, timeout=30)
     response.raise_for_status()
     return response.json()
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_history_image(url):
-    response = requests.get(url, timeout=30)
+def fetch_history_image(path):
+    response = requests.get(f'{API_URL}{path}', timeout=30)
     response.raise_for_status()
     return response.content
 
@@ -45,11 +66,7 @@ def fetch_history_image(url):
 def fetch_history_thumbnail(url):
     response=requests.get(url,timeout=30)
     response.raise_for_status()
-    image=Image.open(io.BytesIO(response.content)).convert('RGB')
-    thumbnail=ImageOps.fit(image,(160,120),method=Image.Resampling.LANCZOS)
-    output=io.BytesIO()
-    thumbnail.save(output,format='JPEG',quality=78,optimize=True)
-    return output.getvalue()
+    return response.content
 
 def detail(r):
     try:return r.json().get('detail',r.text)
@@ -70,6 +87,7 @@ def enregistrer_image_historique(image_bytes):
             st.error(f'Erreur historique : {r.text}')
         else:
             fetch_history_images.clear()
+            st.session_state.history_page = 1
 
     except Exception as e:
         st.error(f'Erreur historique : {e}')
@@ -93,7 +111,7 @@ def adapter_caption(data):
     except:return None
 
 @st.cache_data(ttl=60, show_spinner=False)
-def preview_flyer(entreprise, modele, langue, valeurs, image_bytes, fontes=None):
+def preview_flyer(entreprise, modele, langue, valeurs, image_bytes, fontes=None, _request_id=None):
     data = {
         'entreprise': entreprise,
         'modele': modele,
@@ -108,18 +126,15 @@ def preview_flyer(entreprise, modele, langue, valeurs, image_bytes, fontes=None)
         else None
     )
 
-    try:
-        r = requests.post(
-            f'{API_URL}/preview',
-            data=data,
-            files=files,
-            timeout=30
-        )
-
-        return r.content if r.ok else None
-
-    except Exception:
-        return None
+    r = requests.post(
+        f'{API_URL}/preview',
+        data=data,
+        files=files,
+        headers={'X-Request-ID':_request_id} if _request_id else {},
+        timeout=(5, 120)
+    )
+    r.raise_for_status()
+    return r.content
 
 config=api_get('/entreprises')
 if not config: st.stop()
@@ -168,7 +183,8 @@ with gestion_modeles:
     st.subheader("Modèles")
     e=st.selectbox('Entreprise',entreprises,key='new_model_ent')
 
-    modeles_existants=api_get(f'/modeles/{e}') or []
+    catalogue_modeles=api_get(f'/modeles/{e}/catalogue') or {}
+    modeles_existants=list(catalogue_modeles.get('modeles',{}).keys())
 
     action_modele=st.radio(
         'Action',
@@ -185,7 +201,7 @@ with gestion_modeles:
             key='new_model_name'
         )
 
-        objectifs=api_get(f'/objectifs/{e}') or []
+        objectifs=catalogue_modeles.get('objectifs', [])
         choix=objectifs+['➕ Créer un nouvel objectif']
 
         obj=st.radio(
@@ -229,29 +245,18 @@ with gestion_modeles:
                     data={
                         'entreprise':e,
                         'modele':nom.strip(),
-                        'objectif_publication':obj
+                        'objectif_publication':obj,
+                        'zones_modifiables':json.dumps(cfg.get('zones_modifiables',{}),ensure_ascii=False)
                     },
                     files=multipart,
                     timeout=(10, 180)
                 )
 
                 if r.ok:
-                    save=requests.put(
-                        f'{API_URL}/modeles/{e}/{nom.strip()}',
-                        json={
-                            'zones_modifiables':cfg.get('zones_modifiables',{}),
-                            'objectif_publication':obj
-                        },
-                        timeout=10
-                    )
-
-                    if save.ok:
-                        _api_get_json.clear()
-                        st.session_state['modeles_details']={}
-                        st.success('✅ Modèle enregistré avec succès.')
-                        st.rerun()
-                    else:
-                        st.error(detail(save))
+                    _api_get_json.clear()
+                    st.session_state['modeles_details']={}
+                    st.success('✅ Modèle enregistré avec succès.')
+                    st.rerun()
                 else:
                     st.error(detail(r))
 
@@ -353,17 +358,14 @@ with onglet_creation:
 
         with contexte_tab:
             entreprise=st.selectbox('Entreprise',entreprises,key='flyer_ent')
-            modeles=config.get(entreprise,[])
 
-            # Charger les détails des modèles une seule fois
+            # Récupérer le catalogue complet en une seule requête par entreprise.
             if entreprise not in st.session_state.modeles_details:
-                details={}
-                for m in modeles:
-                    c=api_get(f'/modeles/{entreprise}/{m}') or {}
-                    details[m]=c
-                st.session_state.modeles_details[entreprise]=details
+                catalogue=api_get(f'/modeles/{entreprise}/catalogue') or {}
+                st.session_state.modeles_details[entreprise]=catalogue.get('modeles', {})
 
             modeles_details=st.session_state.modeles_details[entreprise]
+            modeles=list(modeles_details)
 
             # Récupérer les objectifs depuis les données déjà chargées
             objectifs=[]
@@ -378,6 +380,17 @@ with onglet_creation:
 
             modele=st.selectbox('Modèle',modeles,key='flyer_model') if modeles else None
             langue=st.selectbox('🌍 Langue du flyer',['Français','English','Español'])
+
+            contexte_image=(entreprise,modele)
+            contexte_precedent=st.session_state.image_model_context
+            if contexte_precedent is not None and contexte_precedent!=contexte_image:
+                st.session_state.image_valide_bytes=None
+                st.session_state.image_croppee_bytes=None
+                st.session_state.history_selection=None
+                st.session_state.history_page=1
+                st.session_state.bg_mode='Par défaut'
+                st.session_state.pop('bg_upload',None)
+            st.session_state.image_model_context=contexte_image
 
         if modele:
             model_cfg=modeles_details.get(modele)
@@ -441,6 +454,18 @@ with onglet_creation:
                             "size":int(zone.get("size",50))
                         }
 
+                    couleur=st.color_picker(
+                        f"Couleur du texte — {nom}",
+                        value=st.session_state.get(f"text_color_{nom}", "#FFFFFF"),
+                        key=f"text_color_{nom}"
+                    )
+                    fontes.setdefault(nom,{
+                        "font":zone.get("font", "Inter"),
+                        "weight":int(zone.get("weight", 400)),
+                        "style":zone.get("style", "normal"),
+                        "size":int(zone.get("size", 50))
+                    })["color"]=couleur
+
                 st.session_state['generation_values']=valeurs
                 st.session_state['generation_fonts']=fontes
 
@@ -497,22 +522,39 @@ with onglet_creation:
                             st.error(detail(r))
 
                 elif mode=='Historique':
+                    if 'history_page' not in st.session_state:
+                        st.session_state.history_page = 1
+
                     try:
-                        images_historique=fetch_history_images()
+                        page_historique=fetch_history_images(st.session_state.history_page)
                     except requests.RequestException as e:
-                        images_historique=[]
+                        page_historique={'items': [], 'has_next': False}
                         st.error(f"Impossible de charger l'historique : {e}")
 
+                    images_historique=page_historique.get('items', [])
                     if images_historique:
                         st.caption('Choisis une image de l’historique')
+                        with ThreadPoolExecutor(max_workers=6) as executor:
+                            futures=[
+                                executor.submit(fetch_history_thumbnail, image['thumbnail_url'])
+                                for image in images_historique
+                            ]
+                            miniatures=[]
+                            for future in futures:
+                                try:
+                                    miniatures.append(future.result())
+                                except Exception as exc:
+                                    miniatures.append(exc)
+
                         colonnes=st.columns(4)
                         for index, image_historique in enumerate(images_historique):
                             nom_image=image_historique.get('nom',f'image_{index}')
                             url_image=image_historique['url']
                             with colonnes[index % len(colonnes)]:
                                 try:
-                                    miniature=fetch_history_thumbnail(url_image)
-                                    st.image(miniature,width=160)
+                                    if isinstance(miniatures[index], Exception):
+                                        raise miniatures[index]
+                                    st.image(miniatures[index],width=160)
                                     selectionnee=st.session_state.get('history_selection')==nom_image
                                     if st.button(
                                         '✓ Sélectionnée' if selectionnee else 'Choisir',
@@ -524,8 +566,29 @@ with onglet_creation:
                                         st.session_state.image_croppee_bytes=None
                                         st.session_state.history_selection=nom_image
                                         st.rerun()
-                                except requests.RequestException as exc:
+                                except Exception as exc:
                                     st.error(f"Miniature indisponible ({nom_image}) : {exc}")
+                        precedente, indicateur_page, suivante = st.columns([1, 2, 1])
+                        with precedente:
+                            if st.button(
+                                '← Précédent',
+                                disabled=st.session_state.history_page <= 1,
+                                key='history_previous_page',
+                                width='stretch'
+                            ):
+                                st.session_state.history_page -= 1
+                                st.rerun()
+                        with indicateur_page:
+                            st.caption(f"Page {st.session_state.history_page}")
+                        with suivante:
+                            if st.button(
+                                'Suivant →',
+                                disabled=not page_historique.get('has_next', False),
+                                key='history_next_page',
+                                width='stretch'
+                            ):
+                                st.session_state.history_page += 1
+                                st.rerun()
                     else:
                         st.info("Aucune image dans l'historique. Veuillez générer ou télécharger une image d'abord.")
 
@@ -606,16 +669,58 @@ with onglet_creation:
             fontes_preview=st.session_state.get('generation_fonts',{})
             image_preview=st.session_state.image_croppee_bytes if mode!='Par défaut' else None
 
-            preview=preview_flyer(
-                entreprise,
-                modele,
-                langue,
-                valeurs_preview,
-                image_preview,
-                fontes_preview
-            )
+            signature_preview=hashlib.sha256(json.dumps({
+                'entreprise':entreprise,
+                'modele':modele,
+                'langue':langue,
+                'valeurs':valeurs_preview,
+                'fontes':fontes_preview,
+                'image':hashlib.sha256(image_preview).hexdigest() if image_preview else None
+            },ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()
 
-            if preview:
+            if (
+                st.session_state.flyer_genere
+                and st.session_state.flyer_genere_signature!=signature_preview
+            ):
+                st.session_state.flyer_genere=None
+                st.session_state.flyer_genere_signature=None
+
+            if st.session_state.preview_flyer_signature!=signature_preview:
+                request_id=uuid.uuid4().hex
+                try:
+                    with st.spinner('Actualisation de la prévisualisation...'):
+                        st.session_state.preview_flyer_bytes=preview_flyer(
+                            entreprise,
+                            modele,
+                            langue,
+                            valeurs_preview,
+                            image_preview,
+                            fontes_preview,
+                            _request_id=request_id
+                        )
+                    st.session_state.preview_flyer_signature=signature_preview
+                    st.session_state.preview_flyer_error_signature=None
+                    st.session_state.preview_flyer_error=None
+                except requests.Timeout:
+                    st.session_state.preview_flyer_bytes=None
+                    st.session_state.preview_flyer_error_signature=signature_preview
+                    st.session_state.preview_flyer_error=(
+                        f"La prévisualisation a dépassé le délai d’attente. Référence : {request_id}"
+                    )
+                except requests.RequestException as exc:
+                    response=getattr(exc,'response',None)
+                    st.session_state.preview_flyer_bytes=None
+                    st.session_state.preview_flyer_error_signature=signature_preview
+                    st.session_state.preview_flyer_error=(
+                        f"Prévisualisation refusée ou indisponible : "
+                        f"{_api_error_message(response)}. Référence : {request_id}"
+                    )
+
+            if (
+                st.session_state.preview_flyer_bytes
+                and st.session_state.preview_flyer_signature==signature_preview
+            ):
+                preview=st.session_state.preview_flyer_bytes
                 img_preview=Image.open(io.BytesIO(preview)).convert("RGB")
                 img_preview=img_preview.filter(ImageFilter.GaussianBlur(radius=3))
 
@@ -624,6 +729,16 @@ with onglet_creation:
                     caption='Prévisualisation — génération non terminée',
                     width='stretch'
                 )
+            elif st.session_state.preview_flyer_error_signature==signature_preview:
+                st.warning(st.session_state.preview_flyer_error or 'Prévisualisation indisponible.')
+                if st.button('Réessayer la prévisualisation',key='retry_flyer_preview'):
+                    st.session_state.preview_flyer_error_signature=None
+                    st.rerun()
+        else:
+            st.session_state.preview_flyer_bytes=None
+            st.session_state.preview_flyer_signature=None
+            st.session_state.preview_flyer_error_signature=None
+            st.session_state.preview_flyer_error=None
 
         flyer_zone=st.empty()
 
@@ -643,6 +758,7 @@ with onglet_creation:
                         enregistrer_image_historique(image_bytes)
 
                     st.session_state.flyer_genere=r.content
+                    st.session_state.flyer_genere_signature=signature_preview
                     preview_zone.empty()
 
                     st.session_state.derniere_data_flyer={'entreprise':entreprise,'template_type':modele,'langue':langue,**valeurs}

@@ -24,13 +24,14 @@ def _extract_zone_number(label):
         return None
 
 
-def _normalize_zone_labels(objects):
+def _normalize_zone_labels(objects, preserve_labels=False):
     normalized = []
     for index, obj in enumerate(objects or [], start=1):
         if not isinstance(obj, dict):
             continue
         cloned = dict(obj)
-        cloned["label"] = f"Zone {index}"
+        label = str(cloned.get("label") or "").strip()
+        cloned["label"] = label if preserve_labels and label else f"Zone {index}"
         normalized.append(cloned)
     return normalized
 
@@ -220,9 +221,15 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
     prochain_numero_key = f"{canvas_key}_prochain_numero"
 
     if canvas_objects_key not in st.session_state:
-        st.session_state[canvas_objects_key] = _normalize_zone_labels(initial_objects)
+        st.session_state[canvas_objects_key] = _normalize_zone_labels(
+            initial_objects,
+            preserve_labels=modification,
+        )
 
-    current_objects = _normalize_zone_labels(st.session_state.get(canvas_objects_key, []))
+    current_objects = _normalize_zone_labels(
+        st.session_state.get(canvas_objects_key, []),
+        preserve_labels=modification,
+    )
     st.session_state[canvas_objects_key] = current_objects
     st.session_state[prochain_numero_key] = 1 if not current_objects else len(current_objects) + 1
 
@@ -234,7 +241,10 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
     if not current_objects and initial_objects:
         initial_drawing = {
             "version": "5.2.4",
-            "objects": _normalize_zone_labels(initial_objects)
+            "objects": _normalize_zone_labels(
+                initial_objects,
+                preserve_labels=modification,
+            )
         }
 
     canvas = st_canvas(
@@ -253,7 +263,7 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
     )
 
     objects = (canvas.json_data or {}).get("objects", [])
-    normalized_objects = _normalize_zone_labels(objects)
+    normalized_objects = _normalize_zone_labels(objects, preserve_labels=modification)
     st.session_state[canvas_objects_key] = normalized_objects
     st.session_state[prochain_numero_key] = 1 if not normalized_objects else len(normalized_objects) + 1
     if canvas.json_data is None:
@@ -282,13 +292,17 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
         hh = min(round(h * factor), image.height - y)
 
         zone_index_key = f"zone_{i}_{entreprise}_{modele}"
-        st.markdown(f"#### Zone {i + 1}")
+        titre_zone = label if modification else f"Zone {i + 1}"
+        st.markdown(f"#### {titre_zone}")
         c1, c2 = st.columns([2, 1])
 
         with c1:
+            name_widget_key = f"name_{zone_index_key}"
+            if modification:
+                name_widget_key = f"{name_widget_key}_{label}"
             name = st.text_input(
                 "Nom de la zone",
-                key=f"name_{zone_index_key}",
+                key=name_widget_key,
                 value=label,
                 placeholder="Ex: titre, prix, image, description..."
             )

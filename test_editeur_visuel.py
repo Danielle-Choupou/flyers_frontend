@@ -21,3 +21,9 @@ def test_normalize_zone_labels_are_sequential():
     objects = [{"label": "Zone 7"}, {"label": "Zone 1"}, {"label": "Titre"}]
     normalized = _normalize_zone_labels(objects)
     assert [obj["label"] for obj in normalized] == ["Zone 1", "Zone 2", "Zone 3"]
+
+
+def test_normalize_zone_labels_can_preserve_saved_names():
+    objects = [{"label": "Titre"}, {"label": "Prix"}, {"label": "  "}]
+    normalized = _normalize_zone_labels(objects, preserve_labels=True)
+    assert [obj["label"] for obj in normalized] == ["Titre", "Prix", "Zone 3"]
