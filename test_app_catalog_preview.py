@@ -39,7 +39,7 @@ def fake_get(url, **kwargs):
     raise AssertionError(f"Unexpected GET: {path}")
 
 
-def test_changing_company_uses_its_catalogue_and_preview_timeout_is_visible():
+def test_changing_company_uses_its_catalogue_and_requires_an_image_for_preview():
     request_ids = []
 
     def timeout_preview(url, **kwargs):
@@ -59,6 +59,6 @@ def test_changing_company_uses_its_catalogue_and_preview_timeout_is_visible():
 
     assert app.selectbox(key="flyer_ent").value == "CAMCI"
     assert app.selectbox(key="flyer_model").options == ["flyer-camci"]
-    assert request_ids
-    assert any(request_ids[-1] in warning.value for warning in app.warning)
+    assert not request_ids
+    assert any('Choisis une image' in info.value for info in app.info)
     assert not app.exception

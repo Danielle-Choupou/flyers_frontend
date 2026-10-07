@@ -111,13 +111,15 @@ def adapter_caption(data):
     except:return None
 
 @st.cache_data(ttl=60, show_spinner=False)
-def preview_flyer(entreprise, modele, langue, valeurs, image_bytes, fontes=None, _request_id=None):
+def preview_flyer(entreprise, modele, langue, valeurs, image_bytes, fontes=None, couleur_filtre="#3F257C", opacite_filtre=0, _request_id=None):
     data = {
         'entreprise': entreprise,
         'modele': modele,
         'langue': langue,
         'valeurs': json.dumps(valeurs, ensure_ascii=False),
-        'fontes': json.dumps(fontes or {}, ensure_ascii=False)
+        'fontes': json.dumps(fontes or {}, ensure_ascii=False),
+        'couleur_filtre': couleur_filtre,
+        'opacite_filtre': opacite_filtre
     }
 
     files = (
@@ -237,7 +239,6 @@ with gestion_modeles:
                 multipart={
                     'base_reference':('base.png',f['base'],'image/png'),
                     'calque_fixe':('overlay.png',f['overlay'],'image/png'),
-                    'fond_defaut':('fond.png',f['fond'],'image/png')
                 }
 
                 r=requests.post(
@@ -346,7 +347,9 @@ with onglet_creation:
     # Valeurs par défaut pour éviter les variables non définies
     modele=None
     model_cfg=None
-    mode='Par défaut'
+    couleur_filtre="#3F257C"
+    opacite_filtre=0
+    mode='Uploader un fichier'
     generate_btn=False
 
     with col1:
@@ -379,6 +382,22 @@ with onglet_creation:
                 modeles=[m for m in modeles if modeles_details.get(m,{}).get('objectif_publication')==objectif]
 
             modele=st.selectbox('Modèle',modeles,key='flyer_model') if modeles else None
+
+            if modele:
+                couleur_filtre=st.color_picker(
+                    'Couleur du filtre',
+                    value='#3F257C',
+                    key=f'couleur_filtre_{entreprise}_{modele}'
+                )
+                opacite_filtre=st.slider(
+                    'Opacite du filtre',
+                    min_value=0,
+                    max_value=100,
+                    value=0,
+                    format='%d%%',
+                    key=f'opacite_filtre_{entreprise}_{modele}'
+                )
+
             langue=st.selectbox('🌍 Langue du flyer',['Français','English','Español'])
 
             contexte_image=(entreprise,modele)
@@ -388,7 +407,7 @@ with onglet_creation:
                 st.session_state.image_croppee_bytes=None
                 st.session_state.history_selection=None
                 st.session_state.history_page=1
-                st.session_state.bg_mode='Par défaut'
+                st.session_state.bg_mode='Uploader un fichier'
                 st.session_state.pop('bg_upload',None)
             st.session_state.image_model_context=contexte_image
 
@@ -504,7 +523,10 @@ with onglet_creation:
                                 
 
             with image_tab:
-                mode=st.radio('Source :',['Par défaut','Uploader un fichier','Générer avec IA','Historique'],horizontal=True,label_visibility='collapsed',key='bg_mode')
+                sources_image=['Uploader un fichier','G'+chr(233)+'n'+chr(233)+'rer avec IA','Historique']
+                if st.session_state.get('bg_mode') not in sources_image:
+                    st.session_state.bg_mode=sources_image[0]
+                mode=st.radio('Source :',sources_image,horizontal=True,label_visibility='collapsed',key='bg_mode')
 
                 if mode=='Uploader un fichier':
                     up=st.file_uploader('Glissez votre image ici',type=['png','jpg','jpeg'],key='bg_upload')
@@ -592,10 +614,7 @@ with onglet_creation:
                     else:
                         st.info("Aucune image dans l'historique. Veuillez générer ou télécharger une image d'abord.")
 
-                if mode=='Par défaut':
-                    st.session_state.image_valide_bytes=None
-                    st.session_state.image_croppee_bytes=None      
-                if st.session_state.image_valide_bytes and mode!='Par défaut':
+                if st.session_state.image_valide_bytes:
                     img=Image.open(io.BytesIO(st.session_state.image_valide_bytes)).convert('RGB')
                     zone_image=next((z for z in (model_cfg or {}).get('zones_modifiables',{}).values() if z.get('type')=='image'),None)
 
@@ -667,7 +686,7 @@ with onglet_creation:
         if modele and model_cfg:
             valeurs_preview=st.session_state.get('generation_values',{})
             fontes_preview=st.session_state.get('generation_fonts',{})
-            image_preview=st.session_state.image_croppee_bytes if mode!='Par défaut' else None
+            image_preview=st.session_state.image_croppee_bytes
 
             signature_preview=hashlib.sha256(json.dumps({
                 'entreprise':entreprise,
@@ -675,6 +694,8 @@ with onglet_creation:
                 'langue':langue,
                 'valeurs':valeurs_preview,
                 'fontes':fontes_preview,
+                'couleur_filtre':couleur_filtre,
+                'opacite_filtre':opacite_filtre,
                 'image':hashlib.sha256(image_preview).hexdigest() if image_preview else None
             },ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()
 
@@ -685,7 +706,7 @@ with onglet_creation:
                 st.session_state.flyer_genere=None
                 st.session_state.flyer_genere_signature=None
 
-            if st.session_state.preview_flyer_signature!=signature_preview:
+            if image_preview and st.session_state.preview_flyer_signature!=signature_preview:
                 request_id=uuid.uuid4().hex
                 try:
                     with st.spinner('Actualisation de la prévisualisation...'):
@@ -696,6 +717,8 @@ with onglet_creation:
                             valeurs_preview,
                             image_preview,
                             fontes_preview,
+                            couleur_filtre=couleur_filtre,
+                            opacite_filtre=opacite_filtre,
                             _request_id=request_id
                         )
                     st.session_state.preview_flyer_signature=signature_preview
@@ -729,6 +752,8 @@ with onglet_creation:
                     caption='Prévisualisation — génération non terminée',
                     width='stretch'
                 )
+            elif not image_preview:
+                st.info("Choisis une image importee, generee par IA ou depuis l'historique pour afficher l'apercu.")
             elif st.session_state.preview_flyer_error_signature==signature_preview:
                 st.warning(st.session_state.preview_flyer_error or 'Prévisualisation indisponible.')
                 if st.button('Réessayer la prévisualisation',key='retry_flyer_preview'):
@@ -743,11 +768,14 @@ with onglet_creation:
         flyer_zone=st.empty()
 
         # génération finale
-        if generate_btn and modele and model_cfg:
+        if generate_btn and modele and model_cfg and not st.session_state.image_croppee_bytes:
+            st.warning("Choisis une image importee, generee par IA ou depuis l'historique avant de generer.")
+
+        if generate_btn and modele and model_cfg and st.session_state.image_croppee_bytes:
             valeurs=st.session_state.get('generation_values',{})
             fontes=st.session_state.get('generation_fonts',{})
-            image_bytes=st.session_state.image_croppee_bytes if mode!='Par défaut' else None
-            data={'entreprise':entreprise,'modele':modele,'langue':langue,'valeurs':json.dumps(valeurs,ensure_ascii=False), 'fontes':json.dumps(fontes,ensure_ascii=False)}
+            image_bytes=st.session_state.image_croppee_bytes
+            data={'entreprise':entreprise,'modele':modele,'langue':langue,'valeurs':json.dumps(valeurs,ensure_ascii=False), 'fontes':json.dumps(fontes,ensure_ascii=False),'couleur_filtre':couleur_filtre,'opacite_filtre':opacite_filtre}
             files={'image_fond':('image_fond.png',image_bytes,'image/png')} if image_bytes else None
 
             try:

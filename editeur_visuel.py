@@ -79,16 +79,14 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
 
         base_bytes = charger_fichier(entreprise, modele, "base_reference")
         overlay_bytes = charger_fichier(entreprise, modele, "calque_fixe")
-        fond_bytes = charger_fichier(entreprise, modele, "fond_defaut")
 
-        if not base_bytes or not overlay_bytes or not fond_bytes:
+        if not base_bytes or not overlay_bytes:
             st.error("Impossible de charger les fichiers du modèle.")
             return None
 
         try:
             base = Image.open(io.BytesIO(base_bytes)).convert("RGBA")
             ov = Image.open(io.BytesIO(overlay_bytes)).convert("RGBA")
-            fd = Image.open(io.BytesIO(fond_bytes)).convert("RGBA")
         except Exception as exc:
             st.error(f"Les fichiers du modèle ne sont pas des images valides : {exc}")
             return None
@@ -107,12 +105,6 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
             key=f"overlay_mod_{entreprise}_{modele}"
         )
 
-        nouveau_fond = st.file_uploader(
-            "Nouveau fond",
-            type=["png", "jpg", "jpeg"],
-            key=f"fond_mod_{entreprise}_{modele}"
-        )
-
         if nouveau_base:
             base = Image.open(io.BytesIO(nouveau_base.getvalue())).convert("RGBA")
             base_bytes = nouveau_base.getvalue()
@@ -123,13 +115,7 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
             overlay_bytes = nouveau_overlay.getvalue()
             fichiers_modifies["calque_fixe"] = ("overlay.png", overlay_bytes, "image/png")
 
-        if nouveau_fond:
-            fd = Image.open(io.BytesIO(nouveau_fond.getvalue())).convert("RGBA")
-            fond_bytes = nouveau_fond.getvalue()
-            fichiers_modifies["fond_defaut"] = ("fond.png", fond_bytes, "image/png")
-
         overlay = ov
-        fond = fd
 
     else:
         st.subheader("Configuration du nouveau modèle")
@@ -146,35 +132,25 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
             key=f"overlay_{entreprise}_{modele}"
         )
 
-        fond = st.file_uploader(
-            "3️⃣ Fond par défaut",
-            type=["png", "jpg", "jpeg"],
-            key=f"fond_{entreprise}_{modele}"
-        )
-
-        if not base or not overlay or not fond:
-            st.info("Charge les 3 fichiers : base, calque fixe transparent et fond par défaut.")
+        if not base or not overlay:
+            st.info("Charge la base de reference et le calque fixe transparent.")
             return None
 
-    if not base or not overlay or not fond:
-        st.info("Les 3 fichiers du modèle sont nécessaires.")
+    if not base or not overlay:
+        st.info("La base de reference et le calque fixe sont necessaires.")
         return None
 
     if modification:
         base_source = io.BytesIO(base_bytes)
         overlay_source = io.BytesIO(overlay_bytes)
-        fond_source = io.BytesIO(fond_bytes)
     else:
         base_bytes = base.getvalue()
         overlay_bytes = overlay.getvalue()
-        fond_bytes = fond.getvalue()
         base_source = base
         overlay_source = overlay
-        fond_source = fond
 
     image = Image.open(base_source).convert("RGBA")
     ov = Image.open(overlay_source).convert("RGBA")
-    fd = Image.open(fond_source).convert("RGBA")
 
     if image.size != ov.size:
         st.error("La base de référence et le calque fixe doivent avoir exactement les mêmes dimensions.")
@@ -237,15 +213,10 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
         st.error("Le composant de dessin n'est pas disponible dans cet environnement.")
         return None
 
-    initial_drawing = None
-    if not current_objects and initial_objects:
-        initial_drawing = {
-            "version": "5.2.4",
-            "objects": _normalize_zone_labels(
-                initial_objects,
-                preserve_labels=modification,
-            )
-        }
+    initial_drawing = {
+        "version": "5.2.4",
+        "objects": initial_objects,
+    } if initial_objects else None
 
     canvas = st_canvas(
         fill_color="rgba(255, 0, 0, 0.15)",
@@ -262,13 +233,19 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
         font_size=16
     )
 
-    objects = (canvas.json_data or {}).get("objects", [])
-    normalized_objects = _normalize_zone_labels(objects, preserve_labels=modification)
+    canvas_data = canvas.json_data
+    if isinstance(canvas_data, dict) and isinstance(canvas_data.get("objects"), list):
+        objects = canvas_data["objects"]
+        normalized_objects = _normalize_zone_labels(
+            objects,
+            preserve_labels=modification,
+        )
+    else:
+        normalized_objects = current_objects
+        objects = normalized_objects
+
     st.session_state[canvas_objects_key] = normalized_objects
     st.session_state[prochain_numero_key] = 1 if not normalized_objects else len(normalized_objects) + 1
-    if canvas.json_data is None:
-        canvas.json_data = {}
-    canvas.json_data["objects"] = normalized_objects
 
     if not objects and not modification:
         st.info("Dessine au moins une zone sur le modèle.")
@@ -428,7 +405,6 @@ def afficher_editeur(entreprise, modele, mode='nouveau', config=None):
         "_files": {
             "base": base_bytes,
             "overlay": overlay_bytes,
-            "fond": fond_bytes
         },
         "_changed_files": fichiers_modifies
     }
